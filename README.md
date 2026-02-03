@@ -57,7 +57,6 @@ The implemented workflow follows these steps:
 ## Repository Structure
 
 ```text
-.
 ├── ICA.Rmd      Main R Markdown file containing the full analysis
 ├── ICA.html     Rendered HTML output of the analysis
 ├── README.md    Project documentation  
