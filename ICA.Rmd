@@ -1,0 +1,1316 @@
+---
+title: "Second Assignment: Independent Component Analysis (ICA)"
+author:
+  - "Miguel Rodríguez Losada (s100568756)"
+  - "Miguel Ramos Cabañas (s100473854)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: 3
+fontsize: 11pt
+geometry: margin=2.5cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(whitening)
+library(plotly)
+library(magick)
+library(EBImage)
+library(abind)
+```
+
+
+# <span style="color:#1f77b4">Case Study 1: Food Image</span>
+
+## <span style="color:#1f77b4">Loading the image and displaying it in a suitable format</span>
+
+In this step, we select an example image and import it from disk as the starting
+point of the analysis. Since the subsequent methodology relies on color
+information, the image is represented in **RGB format**, where each pixel is
+described by three intensity values corresponding to the red, green, and blue
+channels.
+
+\vspace{0.1cm}
+
+We also extract and store the spatial dimensions of the image, as this
+information will be required later to reshape one-dimensional projections back
+into their original two-dimensional structure. Finally, the image is visualized
+to verify that it has been correctly loaded before proceeding to the whitening
+and projection steps.
+
+```{r build_pixel_schema, message=FALSE, warning=FALSE}
+
+# We load the image from the current working directory
+img_path <- file.path(getwd(), "Food.jpg")
+img <- readImage(img_path)
+
+# We ensure the image is in RGB format (three channels)
+if (length(dim(img)) < 3 || dim(img)[3] == 1) {
+  img <- abind(img, img, img, along = 3)
+}
+
+# We extract the image dimensions (height and width)
+img_h <- dim(img)[1]
+img_w <- dim(img)[2]
+
+cat("Image_h:", img_h, "\n")
+cat("Image_w:", img_w, "\n")
+
+# We visualize the image to confirm it has been correctly loaded
+display(img, method = "raster")
+
+# We extract the RGB channels
+R <- img[,,1]
+G <- img[,,2]
+B <- img[,,3]
+
+# We build the pixel-level RGB representation (one row per pixel)
+pixel_data <- data.frame(
+  Red   = as.numeric(R),
+  Green = as.numeric(G),
+  Blue  = as.numeric(B)
+)
+
+# Basic sanity checks
+dim(pixel_data)
+head(pixel_data)
+```
+
+## <span style="color:#1f77b4">Whitening the data</span>
+
+Before searching for projections that maximize bimodality, we apply a 
+**whitening transformation** to the pixel-level RGB data. Whitening is a linear 
+preprocessing step that removes second-order dependencies and rescales the 
+variables so that the transformed data have approximately **zero mean** and an 
+**identity covariance matrix**.
+
+\vspace{0.1cm}
+
+In this implementation, whitening is performed explicitly through the
+**eigendecomposition of the covariance matrix**, following the theoretical
+definition introduced in class. We first center the data, compute the covariance
+matrix, and decompose it into eigenvalues and eigenvectors. The whitening
+transform is obtained by scaling each principal direction by the inverse square
+root of its corresponding eigenvalue.
+
+\vspace{0.1cm}
+
+As a result, the transformed data lie in a sphered space where the RGB channels
+are uncorrelated and have comparable scale. This step is crucial to ensure that
+the subsequent search for optimal projection directions is not biased by scale
+differences or correlations between channels.
+
+```{r whiten_pixel_data, message=FALSE, warning=FALSE}
+
+# We define a function that centers the data and applies PCA-whitening
+pca_whiten <- function(X, eps = 1e-12) {
+  X <- as.matrix(X)
+
+  # We center the data (column-wise)
+  X_centered <- scale(X, center = TRUE, scale = FALSE)
+
+  # We compute the covariance matrix and its eigendecomposition
+  covX <- cov(X_centered)
+  eig  <- eigen(covX)
+
+  # We build the whitening matrix: W = V * D^{-1/2}
+  D_inv_sqrt <- diag(1 / sqrt(eig$values + eps))
+  W <- eig$vectors %*% D_inv_sqrt
+
+  # We obtain whitened data
+  Z <- X_centered %*% W
+
+  return(Z)
+}
+
+# We whiten the pixel-level RGB data
+pixel_data_whiten <- pca_whiten(pixel_data)
+
+# Sanity checks (approximately)
+colMeans(pixel_data_whiten)
+cov(pixel_data_whiten)
+```
+
+## <span style="color:#1f77b4">Maximizing bimodality via the Fisher index</span>
+
+To evaluate whether a one-dimensional projection separates the image into two
+distinct regions, we project the whitened RGB data onto a direction
+\(w \in \mathbb{R}^3\) and obtain scalar values \(s = Zw\). We then segment the
+projection into two classes using k-means with \(k = 2\). The quality of the
+resulting separation is quantified using the **Fisher index**, which increases
+when the class means are far apart and within-class variability is small.
+
+\vspace{0.1cm}
+
+The following functions implement the Fisher index computation and the
+evaluation of a projection direction \(w\) through projection, k-means
+segmentation, and Fisher index calculation.
+
+```{r step3_fisher_functions, message=FALSE, warning=FALSE}
+
+# We store the whitened RGB matrix (n_pixels x 3)
+Z <- as.matrix(pixel_data_whiten)
+
+# Fisher index for a 1D projection after a 2-class segmentation
+fisher_index_1d <- function(s, labels) {
+  s1 <- s[labels == 1]
+  s2 <- s[labels == 2]
+  m1 <- mean(s1); m2 <- mean(s2)
+  v1 <- var(s1);  v2 <- var(s2)
+  (m1 - m2)^2 / (v1 + v2 + 1e-12)
+}
+
+# Given a projection direction w: project, segment with k-means (k=2), compute Fisher index
+fisher_for_direction <- function(w, Zmat, nstart = 10) {
+  w <- as.numeric(w)
+  w <- w / sqrt(sum(w^2))        # ensure unit norm
+  s <- drop(Zmat %*% w)          # 1D projection
+
+  km <- kmeans(s, centers = 2, nstart = nstart)
+  J  <- fisher_index_1d(s, km$cluster)
+
+  list(J = J, s = s, cluster = km$cluster, centers = as.numeric(km$centers))
+}
+```
+
+### <span style="color:#1f77b4">Searching over projection directions</span>
+
+Since only the direction of \(w\) matters (not its magnitude), candidate
+projections can be restricted to the **unit sphere**. We parameterize the sphere
+using spherical coordinates \((\theta,\phi)\) and evaluate the Fisher index on a
+discretized grid. To reduce computational cost, we compute the Fisher index on a
+random subset of pixels, which provides a reliable approximation of the Fisher
+surface.
+
+```{r step3_sphere_search, message=FALSE, warning=FALSE}
+
+# Sphere parameterization (unit vector in R^3)
+w_spherical <- function(theta, phi) {
+  c(cos(theta) * cos(phi),
+    sin(theta) * cos(phi),
+    sin(phi))
+}
+
+# We subsample pixels for faster optimization
+set.seed(123)
+n_sub <- min(30000, nrow(Z))
+idx_sub <- sample(seq_len(nrow(Z)), n_sub)
+Zs <- Z[idx_sub, , drop = FALSE]
+
+# Grid over angles
+theta_grid <- seq(0, 2*pi, length.out = 121)
+phi_grid   <- seq(-pi/2, pi/2, length.out = 81)
+
+# Fisher surface J(phi, theta)
+J_surf <- matrix(NA_real_, nrow = length(phi_grid), ncol = length(theta_grid))
+
+best_J <- -Inf
+best_w <- c(NA, NA, NA)
+best_theta <- NA
+best_phi <- NA
+
+for (i in seq_along(phi_grid)) {
+  ph <- phi_grid[i]
+  for (j in seq_along(theta_grid)) {
+    th <- theta_grid[j]
+    w  <- w_spherical(th, ph)
+    J  <- fisher_for_direction(w, Zs, nstart = 10)$J
+    J_surf[i, j] <- J
+
+    if (J > best_J) {
+      best_J <- J
+      best_w <- w
+      best_theta <- th
+      best_phi <- ph
+    }
+  }
+}
+
+cat("This is the Fisher index value for the optimal projection:\n")
+print(best_J)
+
+cat("\nCorresponding optimal projection direction (w):\n")
+print(best_w)
+```
+
+### <span style="color:#1f77b4">Visualization of the Fisher index surface</span>
+
+The Fisher index values computed over the sphere define an optimization surface
+\(J(\theta,\phi)\). Visualizing this surface helps interpret how sensitive the
+criterion is to the choice of projection direction and highlights the location
+of the optimal direction.
+
+```{r step3_plotly_surface, message=FALSE, warning=FALSE}
+plot_ly(
+  x = theta_grid,
+  y = phi_grid,
+  z = J_surf,
+  type = "surface"
+) %>%
+  layout(
+    title = "Fisher index surface J(theta, phi)",
+    scene = list(
+      xaxis = list(title = "theta"),
+      yaxis = list(title = "phi"),
+      zaxis = list(title = "Fisher index")
+    )
+  )
+```
+
+### <span style="color:#1f77b4">Optimal projection on the full image and segmentation rule</span>
+
+We now apply the optimal direction \(w_1\) to all pixels to obtain the final
+projection. The resulting scalar values are reshaped back to the original image
+dimensions to visualize the projection as a grayscale image.
+
+\vspace{0.1cm}
+
+To assess bimodality and define a segmentation rule, we inspect the histogram of
+projected values. A natural cutoff is obtained as the midpoint between the two
+k-means centers in the projected space, yielding an interpretable threshold for
+two-class segmentation.
+
+```{r step3_best_projection_outputs, message=FALSE, warning=FALSE}
+
+# We project ALL pixels using the optimal direction
+res_full_1 <- fisher_for_direction(best_w, Z, nstart = 20)
+s_full_1 <- res_full_1$s
+centers_1 <- res_full_1$centers
+
+# Cutoff defined as the midpoint between k-means centers
+cutoff_1 <- mean(centers_1)
+
+# Projected image (reshape to img_h x img_w)
+proj_img_1 <- matrix(s_full_1, nrow = img_h, ncol = img_w)
+
+# Display projected image (grayscale)
+image(
+  t(apply(proj_img_1, 2, rev)),
+  col = gray.colors(256),
+  axes = FALSE,
+  main = "Projected image (optimal direction)"
+)
+
+# Histogram with cutoff
+hist(
+  s_full_1,
+  breaks = 100,
+  col = "lightgray",
+  border = "white",
+  main = "Histogram of optimal projection with cutoff",
+  xlab = "Projected value"
+)
+abline(v = cutoff_1, col = "red", lwd = 2, lty = 2)
+legend(
+  "topright",
+  legend = sprintf("Cutoff = %.3f", cutoff_1),
+  col = "red", lwd = 2, lty = 2, bty = "n"
+)
+
+# Suggested segmentation (thresholding the projection)
+seg_1 <- ifelse(s_full_1 > cutoff_1, 1, 2)
+seg_img_1 <- matrix(seg_1, nrow = img_h, ncol = img_w)
+
+image(
+  t(apply(seg_img_1, 2, rev)),
+  col = c("black", "white"),
+  axes = FALSE,
+  main = "Segmentation induced by the optimal projection"
+)
+```
+
+## <span style="color:#1f77b4">Optimal projection orthogonal to the first direction</span>
+
+After obtaining the optimal projection direction \(w_1\), we now seek
+a second direction \(w_2\) that maximizes the Fisher index **under the constraint
+of orthogonality**, that is,
+\[
+w_2^\top w_1 = 0, \qquad \lVert w_2 \rVert = 1.
+\]
+
+Geometrically, the orthogonality condition restricts \(w_2\) to the plane whose
+normal vector is \(w_1\). The intersection between this plane and the unit sphere
+is a **unit circle**, so instead of searching over the whole sphere, it is enough
+to evaluate projection directions lying on this circle.
+
+\vspace{0.1cm}
+
+To parameterize the circle, we build an orthonormal basis \(\{u, v\}\) for the
+plane orthogonal to \(w_1\). Then, any unit vector orthogonal to \(w_1\) can be
+written as
+\[
+w(\alpha) = \cos(\alpha)\,u + \sin(\alpha)\,v, 
+\qquad \alpha \in [0, 2\pi).
+\]
+
+We evaluate the Fisher index along a discretized grid of angles \(\alpha\) and
+select the direction \(w_2\) that yields the maximum value. This provides the
+best “second” projection that is guaranteed to be orthogonal to the first one.
+
+```{r step4_step_circle, message=FALSE, warning=FALSE}
+
+# We define w1 as the optimal direction found in Step 3
+w1 <- as.numeric(best_w)
+w1 <- w1 / sqrt(sum(w1^2))
+
+# We choose a reference vector not (almost) parallel to w1
+a <- c(1, 0, 0)
+if (abs(sum(a * w1)) > 0.9) a <- c(0, 1, 0)
+
+# We build an orthonormal basis (u, v) for the plane orthogonal to w1
+u <- a - sum(a * w1) * w1
+u <- u / sqrt(sum(u^2))
+
+# v = w1 × u (cross product), normalized
+v <- c(
+  w1[2] * u[3] - w1[3] * u[2],
+  w1[3] * u[1] - w1[1] * u[3],
+  w1[1] * u[2] - w1[2] * u[1]
+)
+v <- v / sqrt(sum(v^2))
+
+# We subsample pixels for faster evaluation (same idea as Step 3)
+set.seed(123)
+n_sub <- min(30000, nrow(Z))
+idx_sub <- sample(seq_len(nrow(Z)), n_sub)
+Zs <- Z[idx_sub, , drop = FALSE]
+
+# We search along the circle: w(alpha) = cos(alpha) u + sin(alpha) v
+alpha_grid <- seq(0, 2*pi, length.out = 721)
+
+J_circle <- numeric(length(alpha_grid))
+w_candidates <- matrix(NA_real_, nrow = length(alpha_grid), ncol = 3)
+
+best_J2 <- -Inf
+best_w2 <- c(NA, NA, NA)
+best_alpha <- NA
+
+for (k in seq_along(alpha_grid)) {
+  alpha <- alpha_grid[k]
+  w2 <- cos(alpha) * u + sin(alpha) * v
+
+  w_candidates[k, ] <- w2
+  J <- fisher_for_direction(w2, Zs, nstart = 10)$J
+  J_circle[k] <- J
+
+  if (J > best_J2) {
+    best_J2 <- J
+    best_w2 <- w2
+    best_alpha <- alpha
+  }
+}
+
+# We report the optimal orthogonal projection
+cat("This is the Fisher index value for the best orthogonal projection:\n")
+print(best_J2)
+
+cat("\nCorresponding orthogonal projection direction (w2):\n")
+print(best_w2)
+
+# (Optional) quick visualization of J(alpha)
+plot(alpha_grid, J_circle, type = "l",
+     xlab = expression(alpha),
+     ylab = "Fisher index",
+     main = "Fisher index along the circle orthogonal to w1")
+
+# Quick verification
+second_w <- best_w2
+second_J <- best_J2
+cat("\nCheck orthogonality (w1 · w2): ", sum(w1 * best_w2), "\n")
+cat("Check norm ||w2||: ", sqrt(sum(best_w2^2)), "\n")
+```
+
+The Fisher index evaluated along the circle orthogonal to \(w_1\) exhibits several
+local maxima. The optimal orthogonal direction \(w_2\) is selected as the one
+yielding the highest Fisher index value. This completes the identification of a
+second informative projection that is guaranteed to be orthogonal to the first
+one.
+
+\vspace{0.1cm}
+
+In the next step, this projection will be applied to the full image in order to
+analyze its spatial structure and induced segmentation.
+
+## <span style="color:#1f77b4">Third projection and segmentation (orthogonal to \(w_1\) and \(w_2\))</span>
+
+In the previous steps, we identified two informative projection directions:
+\(w_1\), which maximizes the Fisher index over the unit sphere, and \(w_2\), which
+maximizes the Fisher index under the orthogonality constraint \(w_2^\top w_1 = 0\).
+We now complete a full **orthonormal change of basis** in \(\mathbb{R}^3\) by
+finding a third direction \(w_3\) orthogonal to both \(w_1\) and \(w_2\).
+
+\vspace{0.1cm}
+
+Geometrically, since the data live in a three-dimensional whitened RGB space,
+the direction \(w_3\) is uniquely determined (up to sign) as the normal vector to
+the plane spanned by \(\{w_1, w_2\}\). In practice, we compute it using the cross
+product,
+\[
+w_3 = \frac{w_1 \times w_2}{\lVert w_1 \times w_2 \rVert}.
+\]
+
+Once \(w_3\) is obtained, we project all pixels onto this direction, reshape the
+projection back to the original image dimensions, and visualize the projected
+image in grayscale. Finally, we segment the projected values into two classes
+using k-means with \(k=2\), and define a cutoff as the midpoint between the two
+cluster centers. This yields an interpretable threshold-based segmentation rule.
+
+\vspace{0.1cm}
+
+This third projection corresponds to the remaining axis of the new coordinate
+system \(\{w_1, w_2, w_3\}\). Together, these three directions reveal additional
+internal structures in the image by separating information across independent
+projection axes.
+
+```{r step5_third_projection_and_segmentation, message=FALSE, warning=FALSE}
+
+# We ensure w1 and w2 are unit vectors
+w1 <- as.numeric(best_w)
+w1 <- w1 / sqrt(sum(w1^2))
+
+w2 <- as.numeric(best_w2)
+w2 <- w2 / sqrt(sum(w2^2))
+
+# We compute w3 as the (normalized) cross product w1 x w2
+w3 <- c(
+  w1[2] * w2[3] - w1[3] * w2[2],
+  w1[3] * w2[1] - w1[1] * w2[3],
+  w1[1] * w2[2] - w1[2] * w2[1]
+)
+w3 <- w3 / sqrt(sum(w3^2))
+
+# Sanity checks: orthogonality and unit norm
+cat("Check w1 · w3:", sum(w1 * w3), "\n")
+cat("Check w2 · w3:", sum(w2 * w3), "\n")
+cat("Check ||w3||:", sqrt(sum(w3^2)), "\n\n")
+
+cat("Third orthogonal direction (w3):\n")
+print(w3)
+
+# We project ALL pixels onto w3
+s_full_3 <- drop(Z %*% w3)
+
+# We segment the projection using k-means (k=2)
+km3 <- kmeans(s_full_3, centers = 2, nstart = 20)
+centers_3 <- as.numeric(km3$centers)
+
+# Cutoff as midpoint between the two k-means centers
+cutoff_3 <- mean(centers_3)
+
+# Projected image (reshape to img_h x img_w)
+proj_img_3 <- matrix(s_full_3, nrow = img_h, ncol = img_w)
+
+# Display projected image (grayscale)
+image(
+  t(apply(proj_img_3, 2, rev)),
+  col = gray.colors(256),
+  axes = FALSE,
+  main = "Projected image (third direction w3)"
+)
+
+# Histogram with cutoff
+hist(
+  s_full_3,
+  breaks = 100,
+  col = "lightgray",
+  border = "white",
+  main = "Histogram of third projection with cutoff",
+  xlab = "Projected value"
+)
+abline(v = cutoff_3, col = "red", lwd = 2, lty = 2)
+legend(
+  "topright",
+  legend = sprintf("Cutoff = %.3f", cutoff_3),
+  col = "red", lwd = 2, lty = 2, bty = "n"
+)
+
+# Segmentation induced by thresholding the projection
+seg_3 <- ifelse(s_full_3 > cutoff_3, 2, 1)
+seg_img_3 <- matrix(seg_3, nrow = img_h, ncol = img_w)
+
+image(
+  t(apply(seg_img_3, 2, rev)),
+  col = c("black", "white"),
+  axes = FALSE,
+  main = "Segmentation induced by the third projection (w3)"
+)
+```
+
+# <span style="color:#1f77b4">Case Study 2: Test Image</span>
+
+## <span style="color:#1f77b4">Loading the image and displaying it in a suitable format</span>
+
+```{r}
+
+# We load the image from the current working directory
+img_path <- file.path(getwd(), "TestImage.jpg")
+img <- readImage(img_path)
+
+# We ensure the image is in RGB format (three channels)
+if (length(dim(img)) < 3 || dim(img)[3] == 1) {
+  img <- abind(img, img, img, along = 3)
+}
+
+# We extract the image dimensions (height and width)
+img_h <- dim(img)[1]
+img_w <- dim(img)[2]
+
+cat("Image_h:", img_h, "\n")
+cat("Image_w:", img_w, "\n")
+
+# We visualize the image to confirm it has been correctly loaded
+display(img, method = "raster")
+
+# We extract the RGB channels
+R <- img[,,1]
+G <- img[,,2]
+B <- img[,,3]
+
+# We build the pixel-level RGB representation (one row per pixel)
+pixel_data <- data.frame(
+  Red   = as.numeric(R),
+  Green = as.numeric(G),
+  Blue  = as.numeric(B)
+)
+
+# Basic sanity checks
+dim(pixel_data)
+head(pixel_data)
+```
+
+
+## <span style="color:#1f77b4">Whitening the data</span>
+
+```{r}
+
+# We define a function that centers the data and applies PCA-whitening
+pca_whiten <- function(X, eps = 1e-12) {
+  X <- as.matrix(X)
+
+  # We center the data (column-wise)
+  X_centered <- scale(X, center = TRUE, scale = FALSE)
+
+  # We compute the covariance matrix and its eigendecomposition
+  covX <- cov(X_centered)
+  eig  <- eigen(covX)
+
+  # We build the whitening matrix: W = V * D^{-1/2}
+  D_inv_sqrt <- diag(1 / sqrt(eig$values + eps))
+  W <- eig$vectors %*% D_inv_sqrt
+
+  # We obtain whitened data
+  Z <- X_centered %*% W
+
+  return(Z)
+}
+
+# We whiten the pixel-level RGB data
+pixel_data_whiten <- pca_whiten(pixel_data)
+
+# Sanity checks (approximately)
+colMeans(pixel_data_whiten)
+cov(pixel_data_whiten)
+```
+
+## <span style="color:#1f77b4">Maximizing bimodality via the Fisher index</span>
+
+```{r}
+
+# We store the whitened RGB matrix (n_pixels x 3)
+Z <- as.matrix(pixel_data_whiten)
+
+# Fisher index for a 1D projection after a 2-class segmentation
+fisher_index_1d <- function(s, labels) {
+  s1 <- s[labels == 1]
+  s2 <- s[labels == 2]
+  m1 <- mean(s1); m2 <- mean(s2)
+  v1 <- var(s1);  v2 <- var(s2)
+  (m1 - m2)^2 / (v1 + v2 + 1e-12)
+}
+
+# Given a projection direction w: project, segment with k-means (k=2), compute Fisher index
+fisher_for_direction <- function(w, Zmat, nstart = 10) {
+  w <- as.numeric(w)
+  w <- w / sqrt(sum(w^2))        # ensure unit norm
+  s <- drop(Zmat %*% w)          # 1D projection
+
+  km <- kmeans(s, centers = 2, nstart = nstart)
+  J  <- fisher_index_1d(s, km$cluster)
+
+  list(J = J, s = s, cluster = km$cluster, centers = as.numeric(km$centers))
+}
+```
+
+### <span style="color:#1f77b4">Searching over projection directions</span>
+
+```{r}
+
+# Sphere parameterization (unit vector in R^3)
+w_spherical <- function(theta, phi) {
+  c(cos(theta) * cos(phi),
+    sin(theta) * cos(phi),
+    sin(phi))
+}
+
+# We subsample pixels for faster optimization
+set.seed(123)
+n_sub <- min(30000, nrow(Z))
+idx_sub <- sample(seq_len(nrow(Z)), n_sub)
+Zs <- Z[idx_sub, , drop = FALSE]
+
+# Grid over angles
+theta_grid <- seq(0, 2*pi, length.out = 121)
+phi_grid   <- seq(-pi/2, pi/2, length.out = 81)
+
+# Fisher surface J(phi, theta)
+J_surf <- matrix(NA_real_, nrow = length(phi_grid), ncol = length(theta_grid))
+
+best_J <- -Inf
+best_w <- c(NA, NA, NA)
+best_theta <- NA
+best_phi <- NA
+
+for (i in seq_along(phi_grid)) {
+  ph <- phi_grid[i]
+  for (j in seq_along(theta_grid)) {
+    th <- theta_grid[j]
+    w  <- w_spherical(th, ph)
+    J  <- fisher_for_direction(w, Zs, nstart = 10)$J
+    J_surf[i, j] <- J
+
+    if (J > best_J) {
+      best_J <- J
+      best_w <- w
+      best_theta <- th
+      best_phi <- ph
+    }
+  }
+}
+
+cat("This is the Fisher index value for the optimal projection:\n")
+print(best_J)
+
+cat("\nCorresponding optimal projection direction (w):\n")
+print(best_w)
+```
+
+
+### <span style="color:#1f77b4">Visualization of the Fisher index surface</span>
+
+```{r}
+plot_ly(
+  x = theta_grid,
+  y = phi_grid,
+  z = J_surf,
+  type = "surface"
+) %>%
+  layout(
+    title = "Fisher index surface J(theta, phi)",
+    scene = list(
+      xaxis = list(title = "theta"),
+      yaxis = list(title = "phi"),
+      zaxis = list(title = "Fisher index")
+    )
+  )
+```
+
+### <span style="color:#1f77b4">Optimal projection on the full image and segmentation rule</span>
+
+```{r}
+
+# We project ALL pixels using the optimal direction
+res_full_1 <- fisher_for_direction(best_w, Z, nstart = 20)
+s_full_1 <- res_full_1$s
+centers_1 <- res_full_1$centers
+
+# Cutoff defined as the midpoint between k-means centers
+cutoff_1 <- mean(centers_1)
+
+# Projected image (reshape to img_h x img_w)
+proj_img_1 <- matrix(s_full_1, nrow = img_h, ncol = img_w)
+
+# Display projected image (grayscale)
+image(
+  t(apply(proj_img_1, 2, rev)),
+  col = gray.colors(256),
+  axes = FALSE,
+  main = "Projected image (optimal direction)"
+)
+
+# Histogram with cutoff
+hist(
+  s_full_1,
+  breaks = 100,
+  col = "lightgray",
+  border = "white",
+  main = "Histogram of optimal projection with cutoff",
+  xlab = "Projected value"
+)
+abline(v = cutoff_1, col = "red", lwd = 2, lty = 2)
+legend(
+  "topright",
+  legend = sprintf("Cutoff = %.3f", cutoff_1),
+  col = "red", lwd = 2, lty = 2, bty = "n"
+)
+
+# Suggested segmentation (thresholding the projection)
+seg_1 <- ifelse(s_full_1 > cutoff_1, 1, 2)
+seg_img_1 <- matrix(seg_1, nrow = img_h, ncol = img_w)
+
+image(
+  t(apply(seg_img_1, 2, rev)),
+  col = c("black", "white"),
+  axes = FALSE,
+  main = "Segmentation induced by the optimal projection"
+)
+```
+
+
+## <span style="color:#1f77b4">Optimal projection orthogonal to the first direction</span>
+
+```{r}
+
+
+# We define w1 as the optimal direction found in Step 3
+w1 <- as.numeric(best_w)
+w1 <- w1 / sqrt(sum(w1^2))
+
+# We choose a reference vector not (almost) parallel to w1
+a <- c(1, 0, 0)
+if (abs(sum(a * w1)) > 0.9) a <- c(0, 1, 0)
+
+# We build an orthonormal basis (u, v) for the plane orthogonal to w1
+u <- a - sum(a * w1) * w1
+u <- u / sqrt(sum(u^2))
+
+# v = w1 × u (cross product), normalized
+v <- c(
+  w1[2] * u[3] - w1[3] * u[2],
+  w1[3] * u[1] - w1[1] * u[3],
+  w1[1] * u[2] - w1[2] * u[1]
+)
+v <- v / sqrt(sum(v^2))
+
+# We subsample pixels for faster evaluation (same idea as Step 3)
+set.seed(123)
+n_sub <- min(30000, nrow(Z))
+idx_sub <- sample(seq_len(nrow(Z)), n_sub)
+Zs <- Z[idx_sub, , drop = FALSE]
+
+# We search along the circle: w(alpha) = cos(alpha) u + sin(alpha) v
+alpha_grid <- seq(0, 2*pi, length.out = 721)
+
+J_circle <- numeric(length(alpha_grid))
+w_candidates <- matrix(NA_real_, nrow = length(alpha_grid), ncol = 3)
+
+best_J2 <- -Inf
+best_w2 <- c(NA, NA, NA)
+best_alpha <- NA
+
+for (k in seq_along(alpha_grid)) {
+  alpha <- alpha_grid[k]
+  w2 <- cos(alpha) * u + sin(alpha) * v
+
+  w_candidates[k, ] <- w2
+  J <- fisher_for_direction(w2, Zs, nstart = 10)$J
+  J_circle[k] <- J
+
+  if (J > best_J2) {
+    best_J2 <- J
+    best_w2 <- w2
+    best_alpha <- alpha
+  }
+}
+
+# We report the optimal orthogonal projection
+cat("This is the Fisher index value for the best orthogonal projection:\n")
+print(best_J2)
+
+cat("\nCorresponding orthogonal projection direction (w2):\n")
+print(best_w2)
+
+# (Optional) quick visualization of J(alpha)
+plot(alpha_grid, J_circle, type = "l",
+     xlab = expression(alpha),
+     ylab = "Fisher index",
+     main = "Fisher index along the circle orthogonal to w1")
+
+# Quick verification
+second_w <- best_w2
+second_J <- best_J2
+cat("\nCheck orthogonality (w1 · w2): ", sum(w1 * best_w2), "\n")
+cat("Check norm ||w2||: ", sqrt(sum(best_w2^2)), "\n")
+```
+
+
+## <span style="color:#1f77b4">Third projection and segmentation (orthogonal to \(w_1\) and \(w_2\))</span>
+
+```{r}
+
+
+# We ensure w1 and w2 are unit vectors
+w1 <- as.numeric(best_w)
+w1 <- w1 / sqrt(sum(w1^2))
+
+w2 <- as.numeric(best_w2)
+w2 <- w2 / sqrt(sum(w2^2))
+
+# We compute w3 as the (normalized) cross product w1 x w2
+w3 <- c(
+  w1[2] * w2[3] - w1[3] * w2[2],
+  w1[3] * w2[1] - w1[1] * w2[3],
+  w1[1] * w2[2] - w1[2] * w2[1]
+)
+w3 <- w3 / sqrt(sum(w3^2))
+
+# Sanity checks: orthogonality and unit norm
+cat("Check w1 · w3:", sum(w1 * w3), "\n")
+cat("Check w2 · w3:", sum(w2 * w3), "\n")
+cat("Check ||w3||:", sqrt(sum(w3^2)), "\n\n")
+
+cat("Third orthogonal direction (w3):\n")
+print(w3)
+
+# We project ALL pixels onto w3
+s_full_3 <- drop(Z %*% w3)
+
+# We segment the projection using k-means (k=2)
+km3 <- kmeans(s_full_3, centers = 2, nstart = 20)
+centers_3 <- as.numeric(km3$centers)
+
+# Cutoff as midpoint between the two k-means centers
+cutoff_3 <- mean(centers_3)
+
+# Projected image (reshape to img_h x img_w)
+proj_img_3 <- matrix(s_full_3, nrow = img_h, ncol = img_w)
+
+# Display projected image (grayscale)
+image(
+  t(apply(proj_img_3, 2, rev)),
+  col = gray.colors(256),
+  axes = FALSE,
+  main = "Projected image (third direction w3)"
+)
+
+# Histogram with cutoff
+hist(
+  s_full_3,
+  breaks = 100,
+  col = "lightgray",
+  border = "white",
+  main = "Histogram of third projection with cutoff",
+  xlab = "Projected value"
+)
+abline(v = cutoff_3, col = "red", lwd = 2, lty = 2)
+legend(
+  "topright",
+  legend = sprintf("Cutoff = %.3f", cutoff_3),
+  col = "red", lwd = 2, lty = 2, bty = "n"
+)
+
+# Segmentation induced by thresholding the projection
+seg_3 <- ifelse(s_full_3 > cutoff_3, 2, 1)
+seg_img_3 <- matrix(seg_3, nrow = img_h, ncol = img_w)
+
+image(
+  t(apply(seg_img_3, 2, rev)),
+  col = c("black", "white"),
+  axes = FALSE,
+  main = "Segmentation induced by the third projection (w3)"
+)
+```
+
+# <span style="color:#1f77b4">Case Study 3: Town Image</span>
+
+## <span style="color:#1f77b4">Loading the image and displaying it in a suitable format</span>
+
+```{r}
+
+# We load the image from the current working directory
+img_path <- file.path(getwd(), "town.jpg")
+img <- readImage(img_path)
+
+# We ensure the image is in RGB format (three channels)
+if (length(dim(img)) < 3 || dim(img)[3] == 1) {
+  img <- abind(img, img, img, along = 3)
+}
+
+# We extract the image dimensions (height and width)
+img_h <- dim(img)[1]
+img_w <- dim(img)[2]
+
+cat("Image_h:", img_h, "\n")
+cat("Image_w:", img_w, "\n")
+
+# We visualize the image to confirm it has been correctly loaded
+display(img, method = "raster")
+
+# We extract the RGB channels
+R <- img[,,1]
+G <- img[,,2]
+B <- img[,,3]
+
+# We build the pixel-level RGB representation (one row per pixel)
+pixel_data <- data.frame(
+  Red   = as.numeric(R),
+  Green = as.numeric(G),
+  Blue  = as.numeric(B)
+)
+
+# Basic sanity checks
+dim(pixel_data)
+head(pixel_data)
+```
+
+
+## <span style="color:#1f77b4">Whitening the data</span>
+
+```{r}
+
+# We define a function that centers the data and applies PCA-whitening
+pca_whiten <- function(X, eps = 1e-12) {
+  X <- as.matrix(X)
+
+  # We center the data (column-wise)
+  X_centered <- scale(X, center = TRUE, scale = FALSE)
+
+  # We compute the covariance matrix and its eigendecomposition
+  covX <- cov(X_centered)
+  eig  <- eigen(covX)
+
+  # We build the whitening matrix: W = V * D^{-1/2}
+  D_inv_sqrt <- diag(1 / sqrt(eig$values + eps))
+  W <- eig$vectors %*% D_inv_sqrt
+
+  # We obtain whitened data
+  Z <- X_centered %*% W
+
+  return(Z)
+}
+
+# We whiten the pixel-level RGB data
+pixel_data_whiten <- pca_whiten(pixel_data)
+
+# Sanity checks (approximately)
+colMeans(pixel_data_whiten)
+cov(pixel_data_whiten)
+```
+
+## <span style="color:#1f77b4">Maximizing bimodality via the Fisher index</span>
+
+```{r}
+
+# We store the whitened RGB matrix (n_pixels x 3)
+Z <- as.matrix(pixel_data_whiten)
+
+# Fisher index for a 1D projection after a 2-class segmentation
+fisher_index_1d <- function(s, labels) {
+  s1 <- s[labels == 1]
+  s2 <- s[labels == 2]
+  m1 <- mean(s1); m2 <- mean(s2)
+  v1 <- var(s1);  v2 <- var(s2)
+  (m1 - m2)^2 / (v1 + v2 + 1e-12)
+}
+
+# Given a projection direction w: project, segment with k-means (k=2), compute Fisher index
+fisher_for_direction <- function(w, Zmat, nstart = 10) {
+  w <- as.numeric(w)
+  w <- w / sqrt(sum(w^2))        # ensure unit norm
+  s <- drop(Zmat %*% w)          # 1D projection
+
+  km <- kmeans(s, centers = 2, nstart = nstart)
+  J  <- fisher_index_1d(s, km$cluster)
+
+  list(J = J, s = s, cluster = km$cluster, centers = as.numeric(km$centers))
+}
+```
+
+### <span style="color:#1f77b4">Searching over projection directions</span>
+
+```{r}
+
+# Sphere parameterization (unit vector in R^3)
+w_spherical <- function(theta, phi) {
+  c(cos(theta) * cos(phi),
+    sin(theta) * cos(phi),
+    sin(phi))
+}
+
+# We subsample pixels for faster optimization
+set.seed(123)
+n_sub <- min(30000, nrow(Z))
+idx_sub <- sample(seq_len(nrow(Z)), n_sub)
+Zs <- Z[idx_sub, , drop = FALSE]
+
+# Grid over angles
+theta_grid <- seq(0, 2*pi, length.out = 121)
+phi_grid   <- seq(-pi/2, pi/2, length.out = 81)
+
+# Fisher surface J(phi, theta)
+J_surf <- matrix(NA_real_, nrow = length(phi_grid), ncol = length(theta_grid))
+
+best_J <- -Inf
+best_w <- c(NA, NA, NA)
+best_theta <- NA
+best_phi <- NA
+
+for (i in seq_along(phi_grid)) {
+  ph <- phi_grid[i]
+  for (j in seq_along(theta_grid)) {
+    th <- theta_grid[j]
+    w  <- w_spherical(th, ph)
+    J  <- fisher_for_direction(w, Zs, nstart = 10)$J
+    J_surf[i, j] <- J
+
+    if (J > best_J) {
+      best_J <- J
+      best_w <- w
+      best_theta <- th
+      best_phi <- ph
+    }
+  }
+}
+
+cat("This is the Fisher index value for the optimal projection:\n")
+print(best_J)
+
+cat("\nCorresponding optimal projection direction (w):\n")
+print(best_w)
+```
+
+
+### <span style="color:#1f77b4">Visualization of the Fisher index surface</span>
+
+```{r}
+plot_ly(
+  x = theta_grid,
+  y = phi_grid,
+  z = J_surf,
+  type = "surface"
+) %>%
+  layout(
+    title = "Fisher index surface J(theta, phi)",
+    scene = list(
+      xaxis = list(title = "theta"),
+      yaxis = list(title = "phi"),
+      zaxis = list(title = "Fisher index")
+    )
+  )
+```
+
+### <span style="color:#1f77b4">Optimal projection on the full image and segmentation rule</span>
+
+```{r}
+
+# We project ALL pixels using the optimal direction
+res_full_1 <- fisher_for_direction(best_w, Z, nstart = 20)
+s_full_1 <- res_full_1$s
+centers_1 <- res_full_1$centers
+
+# Cutoff defined as the midpoint between k-means centers
+cutoff_1 <- mean(centers_1)
+
+# Projected image (reshape to img_h x img_w)
+proj_img_1 <- matrix(s_full_1, nrow = img_h, ncol = img_w)
+
+# Display projected image (grayscale)
+image(
+  t(apply(proj_img_1, 2, rev)),
+  col = gray.colors(256),
+  axes = FALSE,
+  main = "Projected image (optimal direction)"
+)
+
+# Histogram with cutoff
+hist(
+  s_full_1,
+  breaks = 100,
+  col = "lightgray",
+  border = "white",
+  main = "Histogram of optimal projection with cutoff",
+  xlab = "Projected value"
+)
+abline(v = cutoff_1, col = "red", lwd = 2, lty = 2)
+legend(
+  "topright",
+  legend = sprintf("Cutoff = %.3f", cutoff_1),
+  col = "red", lwd = 2, lty = 2, bty = "n"
+)
+
+# Suggested segmentation (thresholding the projection)
+seg_1 <- ifelse(s_full_1 > cutoff_1, 1, 2)
+seg_img_1 <- matrix(seg_1, nrow = img_h, ncol = img_w)
+
+image(
+  t(apply(seg_img_1, 2, rev)),
+  col = c("black", "white"),
+  axes = FALSE,
+  main = "Segmentation induced by the optimal projection"
+)
+```
+
+
+## <span style="color:#1f77b4">Optimal projection orthogonal to the first direction</span>
+
+```{r}
+
+
+# We define w1 as the optimal direction found in Step 3
+w1 <- as.numeric(best_w)
+w1 <- w1 / sqrt(sum(w1^2))
+
+# We choose a reference vector not (almost) parallel to w1
+a <- c(1, 0, 0)
+if (abs(sum(a * w1)) > 0.9) a <- c(0, 1, 0)
+
+# We build an orthonormal basis (u, v) for the plane orthogonal to w1
+u <- a - sum(a * w1) * w1
+u <- u / sqrt(sum(u^2))
+
+# v = w1 × u (cross product), normalized
+v <- c(
+  w1[2] * u[3] - w1[3] * u[2],
+  w1[3] * u[1] - w1[1] * u[3],
+  w1[1] * u[2] - w1[2] * u[1]
+)
+v <- v / sqrt(sum(v^2))
+
+# We subsample pixels for faster evaluation (same idea as Step 3)
+set.seed(123)
+n_sub <- min(30000, nrow(Z))
+idx_sub <- sample(seq_len(nrow(Z)), n_sub)
+Zs <- Z[idx_sub, , drop = FALSE]
+
+# We search along the circle: w(alpha) = cos(alpha) u + sin(alpha) v
+alpha_grid <- seq(0, 2*pi, length.out = 721)
+
+J_circle <- numeric(length(alpha_grid))
+w_candidates <- matrix(NA_real_, nrow = length(alpha_grid), ncol = 3)
+
+best_J2 <- -Inf
+best_w2 <- c(NA, NA, NA)
+best_alpha <- NA
+
+for (k in seq_along(alpha_grid)) {
+  alpha <- alpha_grid[k]
+  w2 <- cos(alpha) * u + sin(alpha) * v
+
+  w_candidates[k, ] <- w2
+  J <- fisher_for_direction(w2, Zs, nstart = 10)$J
+  J_circle[k] <- J
+
+  if (J > best_J2) {
+    best_J2 <- J
+    best_w2 <- w2
+    best_alpha <- alpha
+  }
+}
+
+# We report the optimal orthogonal projection
+cat("This is the Fisher index value for the best orthogonal projection:\n")
+print(best_J2)
+
+cat("\nCorresponding orthogonal projection direction (w2):\n")
+print(best_w2)
+
+# (Optional) quick visualization of J(alpha)
+plot(alpha_grid, J_circle, type = "l",
+     xlab = expression(alpha),
+     ylab = "Fisher index",
+     main = "Fisher index along the circle orthogonal to w1")
+
+# Quick verification
+second_w <- best_w2
+second_J <- best_J2
+cat("\nCheck orthogonality (w1 · w2): ", sum(w1 * best_w2), "\n")
+cat("Check norm ||w2||: ", sqrt(sum(best_w2^2)), "\n")
+```
+
+
+## <span style="color:#1f77b4">Third projection and segmentation (orthogonal to \(w_1\) and \(w_2\))</span>
+
+```{r}
+
+
+# We ensure w1 and w2 are unit vectors
+w1 <- as.numeric(best_w)
+w1 <- w1 / sqrt(sum(w1^2))
+
+w2 <- as.numeric(best_w2)
+w2 <- w2 / sqrt(sum(w2^2))
+
+# We compute w3 as the (normalized) cross product w1 x w2
+w3 <- c(
+  w1[2] * w2[3] - w1[3] * w2[2],
+  w1[3] * w2[1] - w1[1] * w2[3],
+  w1[1] * w2[2] - w1[2] * w2[1]
+)
+w3 <- w3 / sqrt(sum(w3^2))
+
+# Sanity checks: orthogonality and unit norm
+cat("Check w1 · w3:", sum(w1 * w3), "\n")
+cat("Check w2 · w3:", sum(w2 * w3), "\n")
+cat("Check ||w3||:", sqrt(sum(w3^2)), "\n\n")
+
+cat("Third orthogonal direction (w3):\n")
+print(w3)
+
+# We project ALL pixels onto w3
+s_full_3 <- drop(Z %*% w3)
+
+# We segment the projection using k-means (k=2)
+km3 <- kmeans(s_full_3, centers = 2, nstart = 20)
+centers_3 <- as.numeric(km3$centers)
+
+# Cutoff as midpoint between the two k-means centers
+cutoff_3 <- mean(centers_3)
+
+# Projected image (reshape to img_h x img_w)
+proj_img_3 <- matrix(s_full_3, nrow = img_h, ncol = img_w)
+
+# Display projected image (grayscale)
+image(
+  t(apply(proj_img_3, 2, rev)),
+  col = gray.colors(256),
+  axes = FALSE,
+  main = "Projected image (third direction w3)"
+)
+
+# Histogram with cutoff
+hist(
+  s_full_3,
+  breaks = 100,
+  col = "lightgray",
+  border = "white",
+  main = "Histogram of third projection with cutoff",
+  xlab = "Projected value"
+)
+abline(v = cutoff_3, col = "red", lwd = 2, lty = 2)
+legend(
+  "topright",
+  legend = sprintf("Cutoff = %.3f", cutoff_3),
+  col = "red", lwd = 2, lty = 2, bty = "n"
+)
+
+# Segmentation induced by thresholding the projection
+seg_3 <- ifelse(s_full_3 > cutoff_3, 2, 1)
+seg_img_3 <- matrix(seg_3, nrow = img_h, ncol = img_w)
+
+image(
+  t(apply(seg_img_3, 2, rev)),
+  col = c("black", "white"),
+  axes = FALSE,
+  main = "Segmentation induced by the third projection (w3)"
+)
+```
+
+
+
