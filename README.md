@@ -55,7 +55,7 @@ The implemented workflow follows these steps:
 - **Visualization:** image plots, histograms, interactive 3D surfaces
 
 ## Repository Structure
-
+.
 ├── ICA.Rmd      # Main R Markdown file containing the full analysis
 ├── ICA.html     # Rendered HTML output of the analysis
-├── README.md    # Project documentation         
+├── README.md    # Project documentation     
